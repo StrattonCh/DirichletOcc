@@ -1,0 +1,10 @@
+base
+dplyr
+nimble
+htmltools
+ggplot2
+sf
+Rcpp
+RcppArmadillo
+inline
+mvtnorm

@@ -1,0 +1,1600 @@
+---
+title: "Dirichlet process mixture models in NIMBLE"
+author: "Christian Stratton"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+header-includes:
+  - \usepackage{setspace}\doublespacing
+  - \usepackage{mdframed, caption}
+  - \usepackage[linesnumbered,lined,boxed,commentsnumbered]{algorithm2e}
+  - \usepackage{float}
+  - \floatplacement{figure}{H} 
+bibliography: bibliography.bib
+csl: biometrics_notes.csl
+---
+
+```{r, include = F}
+rm(list = ls())
+
+# packages
+packs <- c("dplyr", "nimble", "htmltools", "ggplot2", "sf", "Rcpp", "RcppArmadillo", "inline", "mvtnorm")
+sapply(packs, require, character.only = T)
+rm(packs)
+
+# center images
+library(htmltools)
+knitr::opts_chunk$set(
+  fig.align = "center"
+)
+knitr::knit_hooks$set(imgcenter = function(before, options, envir){
+  if (before) {
+    HTML("<p align='center'>")
+  } else {
+    HTML("</p>")
+  }
+})
+
+# knitr options
+knitr::opts_chunk$set(cache = TRUE, fig.dim = c(10, 8), message = FALSE, warning = FALSE, comment = NA)
+source("rds files/helpers.R")
+```
+
+\newpage
+
+# Introduction
+
+The purpose of this document is to describe the spatial multi-species occupancy model recently developed by @wright2021 and describe how infinite mixture models can be used to improve that modeling framework.. We begin by describing necessary background to both the spatial occupancy model and Dirichlet process mixture models (DPMMs), then implement various DPMMs in `nimble`, and conclude by incorporating an infinite mixture in the spatial occupancy model. 
+
+# The Dirichlet process and applications
+
+The Dirichlet process is a stochastic process that is often used in Bayesian nonparameterics, particularly in infinite mixture models and clustering applications. The process is an infinite dimensional extension of the Dirichlet distribution, similar to how the Gaussian process relates to the multivariate normal distribution. This is advantageous, as it allows for clustering algorithms that do not require specification of the number of groups *a priori*. 
+
+## The Dirichlet process
+
+### Probability mass function
+
+We begin by formally defining the DP, following the original definition from [@ferguson1973]. Let $\Omega$ be a measurable space, $\boldsymbol{A} = \{A_1, ..., A_K\}$ be a finite partition of that space, and $G$ be a random distribution over that space. Then $G \sim DP(\alpha, G_0)$ if
+\begin{equation}
+G(A_1), ..., G(A_K) \sim Dir(\alpha G_0(A_1), ..., \alpha G_0(A_K))
+\end{equation}
+for every partition of $\Omega$. In this definition, $\alpha$ and $G_0$ represent a concentration parameter and base measure, respectively. The roles of each of these parameters are most easily understood by inspecting the central moments of the DP. From [@ferguson1973], we have:
+\begin{equation}
+\begin{split}
+E(G(A)) &= G_0(A) \\
+Var(G(A)) &= \frac{G_0(A)(1 - G_0(A))}{\alpha + 1}
+\end{split}
+\end{equation}
+@song2017 notes that these moments suggest that the expectation of the DP is the base measure, and that the DP therefore samples around the base measure. Furthermore, the concentration parameter scales the variance. Therefore, as $\alpha$ increases, we expect samples from the DP to concentrate tightly around the base measure, $G_0(A)$. 
+
+It is important to note that while a base measure can be continuous, sampled distributions from a DP are discrete with probability one. That is, there is a positive probability that draws from a DP will identical. Therefore, DP provide a natural clustering mechanism [@blackwell1973]. 
+
+### Posterior distribution
+
+Let $G \sim DP(\alpha, G_0)$ and let $\theta_1, ..., \theta_n$ be samples from $G$. Then the posterior distribution of $G$ given the observed data $\theta_1, ..., \theta_n$ is also a DP [@gorur2007]. That is, 
+\begin{equation}
+G | \theta_1, ..., \theta_n \sim DP\left(\alpha + n, \frac{\alpha G_0 + \sum_{i=1}^n \delta_{\theta_i}(.)}{\alpha + n}\right)
+\end{equation}
+where $\delta_{\theta_i}(.)$ denotes the unit measure centered at $\theta_i$. 
+
+### Representations of the Dirichlet process
+
+There are three common representations of the Dirichlet process: the Polya urn process, the Chinese restaurant process, and the stick-breaking representation. The first two representations are discussed below. 
+
+**The Polya urn process**
+
+This process was first discussed by @blackwell1973, who describe the relationship between a Pólya sequence and the DP. A sequence $\{\theta_i\}_{i=1}^n$ (for $n \geq 1$) of random values in $\mathcal{X}$ is a Pólya sequence with parameters $\alpha$ and $G_0$ if 
+\[
+\theta_1 \sim G_0
+\]
+and 
+\begin{equation}
+(\theta_{n+1} | \theta_1, ..., \theta_n) \sim G_n = \frac{\alpha G_0 + \sum_{i=1}^n \delta_{\theta_i}(.)}{\alpha + n}
+\end{equation}
+
+In this metaphor, we imagine $\mathcal{X}$ to be an urn with $\alpha$ balls, and $G_0$ to be the distribution that describes the distribution of colors of balls, such that there are $\alpha G_0(\theta)$ balls of color $\theta$. The sequence $\{\theta_i\}_{i=1}^n$ then describes the result of drawing $n$ balls from the urn sequentially, each time replacing the drawn ball with a ball of the same color. 
+
+@blackwell1973 showed that when the discrete color palette described in this metaphor is a extended to a continuum of colors and $n \rightarrow \infty$, the Pólya urn scheme converges to a DP. More formally, they showed that if the rules of the Pólya urn scheme described above hold, then 
+\begin{itemize}
+\item[1)] $G_n$ converges almost surely as $n \rightarrow \infty$ to a random distribution $G$
+\item[2)] $G$ has a $DP(\alpha, G_0)$ distribution
+\item[3)] the sequence $\{\theta_i\}_{i=1}^n$ is a sample from $G$
+\end{itemize}
+
+**The Chinese restaurant process**
+
+The Chinese restaurant process (CRP), introduced by @aldous1985, is another way to construct the DP and makes the clustering mechanism apparent. Consider a Chinese restaurant with an infinite number of tables and $n$ customers labeled $\{1, 2, ..., n\}$ that enter the restaurant sequentially. The first customer occupies the first table, labeled table 1. The next customer joins the first with probability $\frac{1}{1 + \alpha}$ or starts a new table with probability $\frac{\alpha}{1 + \alpha}$. In general, suppose there are $K$ current occupied tables, with $n_k$ customers at each table. A new customer joins one of the $K$ occupied tables with probability $\frac{n_k}{\alpha + n - 1}$ or sits at an unoccupied table with probability $\frac{\alpha}{\alpha + n - 1}$. The figure below provides a graphical representation of this process. 
+
+\begin{figure}[H]
+\centering
+\includegraphics{crp}
+\caption*{Graphical representation of the Chinese restaurant process from Song (2017).}
+\end{figure}
+
+Note that the number of tables (henceforth clusters) is related to the $\alpha$ parameter. In particular, we expect there to be $\alpha \log(n)$ clusters on average. To better understand this clustering mechanism, we provide examples of a CRP for $n = 1000$ customers and varying values of $\alpha$ below. 
+
+\singlespacing
+```{r, message = F, warning = F}
+crp <- function(alpha, n){
+  z <- 1
+  for(i in 2:n){
+    n <- length(z) + 1
+    join <- table(z) / (alpha + n - 1)
+    new <- alpha / (alpha + n - 1)
+    
+    tmp <- c(Hmisc::rMultinom(matrix(c(join, new), nrow = 1), m = 1))
+    z <- c(z, tmp)
+  }
+  
+  return(z)
+}
+
+alphas <- c(1, 10, 50, 100, 500, 1000)
+n = 1000
+crp.samples <- sapply(alphas, FUN = function(x) crp(x, n))
+plot.tbl <- tibble(z = c(crp.samples), 
+                   alpha = as.factor(paste0('alpha = ', rep(alphas, each = n)))) %>%
+  mutate(alpha = factor(alpha, levels = paste0('alpha = ', alphas)))
+
+plot.tbl %>%
+  ggplot(aes(x = z)) +
+  geom_histogram() +
+  facet_wrap(~ alpha) + 
+  theme_bw()
+```
+\doublespacing
+
+## Dirichlet process mixture models
+
+The Dirichlet process mixture model (DPMM) provides a means for clustering without specifying the number of clusters in advance. These models describe data $y_1, ..., y_n$ (which could be multivariate and real-valued or categorical) as arising from a mixture of distributions, $F(\theta)$. Let $G$ denote the mixing distribution over $\theta$. Placing a Dirichlet process prior on $G$ results in the following model [@neal2000]:
+\begin{equation}
+\begin{split}
+y_i | \theta_i &\sim F(\theta_i) \\
+\theta_i | G &\sim G \\
+G &\sim \text{DP}(\alpha, G_0)
+\end{split}
+\end{equation}
+
+### Alternative parametrizations
+
+Consider the following finite mixture model:
+\begin{equation}
+\begin{split}
+\boldsymbol{y}_i | z_i, \boldsymbol{\mu}_k, \boldsymbol{\Sigma}_k &\sim \mathcal{N}(\boldsymbol{\mu}_k, \boldsymbol{\Sigma}_k) \\
+z_i | \boldsymbol{\pi} &\sim \text{multinomial}(1, \boldsymbol{\pi}) \\
+\{\boldsymbol{\mu}_k, \boldsymbol{\Sigma}_k\} &\sim \text{NIW}(\beta) \\
+\boldsymbol{\pi} &\sim \text{Dirichlet}(\alpha / K, ..., \alpha / K)
+\end{split}
+\end{equation}
+
+where $\beta = \{\boldsymbol{\mu}_0, \lambda_0, \nu_0, \boldsymbol{S}_0 \}$. @neal2000 showed that a Dirichlet process mixture model arises by taking the limit as $K \rightarrow \infty$. This parametrization is advantageous in that it allows for a straight-forward application of the CRP to sample the latent states in a Gibbs sampler, discussed below. 
+
+### Influence of prior distributions
+
+The prior mass associated with each number of groups in a DPMM is described in @antoniak1974. This mass is a function of the sample size and concentration parameter. We first visualize this mass for $n=300$ and $\alpha = 1$. 
+\singlespacing
+```{r}
+# probability mass function from Antoniak (1974)
+antoniak <- function(k, alpha, n){
+  alpha <- gmp::as.bigq(as.character(MASS::fractions(alpha)))
+  
+  # A.n first
+  A.n <- function(x, n){
+    sum(abs(gmp::Stirling1.all(n)) * x^(1:n))
+  }
+  
+  # compute mass
+  out <- as.numeric((abs(gmp::Stirling1(n, k)) * alpha^k) / A.n(alpha, n))
+  return(out)
+}
+
+plot(sapply(1:15, function(x) antoniak(x, 1, 300)), main = "Prior mass on number of groups for n = 300, alpha = 1")
+abline(v = log(300), lty = 2)
+```
+
+Next, we consider $n=300$ and $\alpha = 1/2$. 
+
+```{r}
+alpha <- 1/2
+plot(sapply(1:10, function(x) antoniak(x, alpha, 300)), main = "Prior mass on number of groups for n = 100, alpha = 1/2");abline(v = alpha * log(300), lty = 2)
+```
+\doublespacing
+
+### Label switching 
+
+Identifying Mixtures of Mixtures Using Bayesian Estimation
+
+# Example 1: univariate normal mixture
+
+We begin by fitting an infinite mixture model to a mixture of univariate normal distributions. 
+
+## Simulate data
+
+First, we simulate data from a univariate normal mixture.
+
+\singlespacing
+```{r, eval = T}
+set.seed(01082021)
+data <- list(y = sample(c(
+  rnorm(100, -5, 1.5), rnorm(100, 0, 1), rnorm(100, 5, 1.5)
+), size = 300, replace = F))
+
+ggplot() +
+  geom_histogram(aes(x = data$y), binwidth = .5) +
+  theme_bw() + 
+  labs(
+    title = "Simulated data"
+  )
+```
+\doublespacing
+
+## Fit model 1a
+
+### Raw model fit
+
+Next we fit the model and visualize the raw MCMC results, placing a $\text{gamma}(1,1)$ prior on $\alpha$.
+
+\singlespacing
+```{r, messages = F, eval = F}
+fit_ndpm <- function(constants, data, inits, niter = 20000){
+  
+  # code
+  code <- nimbleCode({
+    z[1:N] ~ dCRP(alpha, size = N)
+    alpha ~ dgamma(1, 1)
+    for(i in 1:M) {
+      theta[i] ~ dnorm(0, var = 100)
+      s2[i] ~ dinvgamma(1, 1)
+    }
+    for(i in 1:N){
+      y[i] ~ dnorm(theta[z[i]], var = s2[z[i]]) 
+    }
+  })
+  
+  # R model
+  model <- nimbleModel(code, constants, data, inits)
+  
+  # C model
+  model_c <- compileNimble(model)
+  
+  # R mcmc
+  monitors <- c('z', 'theta', 's2' , 'alpha')
+  model_conf <- configureMCMC(model, monitors = monitors)
+  mcmc <- buildMCMC(model_conf)
+  
+  # C mcmc
+  mcmc_c <- compileNimble(mcmc)
+  
+  # run
+  mcmc_c$run(niter)
+  
+  # get samples
+  samples <- as.matrix(mcmc_c$mvSamples)
+  
+  # out
+  out <- list(samples = samples)
+  return(out)
+}
+constants <- list(N = length(data$y), M = 50)
+ex1 <- fit_ndpm(
+  constants = constants,
+  data = data,
+  inits = list(
+    theta = rnorm(constants$M, 0, 10),
+    s2 = rinvgamma(constants$M, 1, 1),
+    z = sample(1:10, size = length(data$y), replace = TRUE), 
+    alpha = 1
+  )
+)
+
+saveRDS(ex1, file = "rds files/example 1/ex1_model1a.rds")
+```
+
+```{r}
+# read in model, discard warmup
+ex1 <- readRDS("rds files/example 1/ex1_model1a.rds")
+warmup <- 15000
+samples <- ex1$samples[(warmup+1):nrow(ex1$samples),]
+
+# determine which parameters where never updated 
+remove <- which(samples[,] %>% apply(., 2, function(x) all(x == unique(x)[1])))
+
+# get dataframe
+model_tbl <- tibble(
+  estimate = c(samples),
+  parameter = rep(colnames(samples), each = nrow(samples)),
+  iter = rep((warmup+1):nrow(ex1$samples), ncol(samples))
+) %>%
+  filter(!(parameter %in% names(remove)))
+
+# visualize
+model_tbl %>%
+  filter(grepl(pattern = "theta", x = parameter)) %>%
+  mutate(parameter = factor(parameter, levels = unique(parameter))) %>%
+  ggplot() + 
+  geom_line(aes(x = iter, y = estimate, col = parameter)) +
+  theme_bw() +
+  labs(
+    title = bquote("Raw MCMC mean estimates by group:" ~ alpha ~ " ~ gamma(1,1)")
+  )
+```
+
+```{r, comment = NA}
+model_tbl %>%
+  filter(grepl(pattern = "z", x = parameter)) %>%
+  group_by(iter) %>%
+  summarize(num.clus = length(unique(estimate))) %>%
+  select(num.clus) %>% 
+  table(.) / length(unique(model_tbl$iter))
+```
+\doublespacing
+
+### Label-switching adjustment
+
+\singlespacing
+```{r, eval = T}
+set.seed(1)
+samples.relabel <- label.switch.sfw(samples)
+
+tibble(
+  estimate = c(samples.relabel[,grepl("theta", colnames(samples.relabel))]),
+  iter = rep(1:nrow(samples.relabel), sum(grepl("theta", colnames(samples.relabel)))), 
+  parameter = rep(colnames(samples.relabel)[grepl("theta", colnames(samples.relabel))], each = nrow(samples.relabel))
+) %>%
+  ggplot() + 
+  geom_line(aes(x = iter, y = estimate, col = parameter)) +
+  theme_bw() + 
+  labs(title = "Relabeled samples of theta")
+
+dotplot(
+  x = data$y,
+  groups = factor(apply(samples.relabel[,grepl("z", colnames(samples.relabel))], 2, getmode)),
+  prob = as.numeric(apply(samples.relabel[,grepl("z", colnames(samples.relabel))], 2, function(x){
+    sum(x == getmode(x))
+  }) / nrow(samples.relabel)),
+  mean = colMeans(samples.relabel)[grepl("theta", colnames(samples.relabel))],
+  sigma2 = colMeans(samples.relabel)[grepl("s2", colnames(samples.relabel))]
+)
+```
+
+```{r, eval = T}
+set.seed(1)
+samples.relabel <- label.switch.sfw(samples, k.fixed = 3)
+
+tibble(
+  estimate = c(samples.relabel[,grepl("theta", colnames(samples.relabel))]),
+  iter = rep(1:nrow(samples.relabel), sum(grepl("theta", colnames(samples.relabel)))), 
+  parameter = rep(colnames(samples.relabel)[grepl("theta", colnames(samples.relabel))], each = nrow(samples.relabel))
+) %>%
+  ggplot() + 
+  geom_line(aes(x = iter, y = estimate, col = parameter)) +
+  theme_bw() + 
+  labs(title = "Relabeled samples of theta")
+
+dotplot(
+  x = data$y,
+  groups = factor(apply(samples.relabel[,grepl("z", colnames(samples.relabel))], 2, getmode)),
+  prob = as.numeric(apply(samples.relabel[,grepl("z", colnames(samples.relabel))], 2, function(x){
+    sum(x == getmode(x))
+  }) / nrow(samples.relabel)),
+  mean = colMeans(samples.relabel)[grepl("theta", colnames(samples.relabel))],
+  sigma2 = colMeans(samples.relabel)[grepl("s2", colnames(samples.relabel))]
+)
+```
+\doublespacing
+
+## Fit model 1b
+
+### Raw model fit
+
+This time we place a $\text{gamma}(1,2)$ prior on $\alpha$.
+
+\singlespacing
+```{r, messages = F, eval = F}
+fit_ndpm <- function(constants, data, inits, niter = 20000){
+  
+  # code
+  code <- nimbleCode({
+    z[1:N] ~ dCRP(alpha, size = N)
+    alpha ~ dgamma(1, 2)
+    for(i in 1:M) {
+      theta[i] ~ dnorm(0, var = 100)
+      s2[i] ~ dinvgamma(1, 1)
+    }
+    for(i in 1:N){
+      y[i] ~ dnorm(theta[z[i]], var = s2[z[i]]) 
+    }
+  })
+  
+  # R model
+  model <- nimbleModel(code, constants, data, inits)
+  
+  # C model
+  model_c <- compileNimble(model)
+  
+  # R mcmc
+  monitors <- c('z', 'theta', 's2' , 'alpha')
+  model_conf <- configureMCMC(model, monitors = monitors)
+  mcmc <- buildMCMC(model_conf)
+  
+  # C mcmc
+  mcmc_c <- compileNimble(mcmc)
+  
+  # run
+  mcmc_c$run(niter)
+  
+  # get samples
+  samples <- as.matrix(mcmc_c$mvSamples)
+  
+  # out
+  out <- list(samples = samples)
+  return(out)
+}
+constants <- list(N = length(data$y), M = 50)
+ex1 <- fit_ndpm(
+  constants = constants,
+  data = data,
+  inits = list(
+    theta = rnorm(constants$M, 0, 10),
+    s2 = rinvgamma(constants$M, 1, 1),
+    z = sample(1:10, size = length(data$y), replace = TRUE), 
+    alpha = 1
+  )
+)
+
+saveRDS(ex1, file = "rds files/example 1/ex1_model1b.rds")
+```
+
+```{r, messages = FALSE}
+# read in model, discard warmup
+ex1 <- readRDS("rds files/example 1/ex1_model1b.rds")
+warmup <- 15000
+samples <- ex1$samples[(warmup+1):nrow(ex1$samples),]
+
+# determine which parameters where never updated 
+remove <- which(samples[,] %>% apply(., 2, function(x) all(x == unique(x)[1])))
+
+# get dataframe
+model_tbl <- tibble(
+  estimate = c(samples),
+  parameter = rep(colnames(samples), each = nrow(samples)),
+  iter = rep((warmup+1):nrow(ex1$samples), ncol(samples))
+) %>%
+  filter(!(parameter %in% names(remove)))
+
+# visualize
+model_tbl %>%
+  filter(grepl(pattern = "theta", x = parameter)) %>%
+  mutate(parameter = factor(parameter, levels = unique(parameter))) %>%
+  ggplot() + 
+  geom_line(aes(x = iter, y = estimate, col = parameter)) +
+  theme_bw() +
+  labs(
+    title = bquote("Raw MCMC mean estimates by group:" ~ alpha ~ " ~ gamma(1,2)")
+  )
+```
+
+```{r, comment = NA}
+model_tbl %>%
+  filter(grepl(pattern = "z", x = parameter)) %>%
+  group_by(iter) %>%
+  summarize(num.clus = length(unique(estimate))) %>%
+  select(num.clus) %>% 
+  table(.) / length(unique(model_tbl$iter))
+```
+\doublespacing
+
+### Label-switching adjustment
+
+\singlespacing
+```{r}
+set.seed(1)
+samples.relabel <- label.switch.sfw(samples)
+
+tibble(
+  estimate = c(samples.relabel[,grepl("theta", colnames(samples.relabel))]),
+  iter = rep(1:nrow(samples.relabel), sum(grepl("theta", colnames(samples.relabel)))), 
+  parameter = rep(colnames(samples.relabel)[grepl("theta", colnames(samples.relabel))], each = nrow(samples.relabel))
+) %>%
+  ggplot() + 
+  geom_line(aes(x = iter, y = estimate, col = parameter)) +
+  theme_bw() + 
+  labs(title = "Relabeled samples of theta") 
+
+dotplot(
+  x = data$y,
+  groups = factor(apply(samples.relabel[,grepl("z", colnames(samples.relabel))], 2, getmode)),
+  prob = as.numeric(apply(samples.relabel[,grepl("z", colnames(samples.relabel))], 2, function(x){
+    sum(x == getmode(x))
+  }) / nrow(samples.relabel)),
+  mean = colMeans(samples.relabel)[grepl("theta", colnames(samples.relabel))],
+  sigma2 = colMeans(samples.relabel)[grepl("s2", colnames(samples.relabel))]
+)
+```
+\doublespacing
+
+# Example 2: bivariate normal mixture
+
+## Simulate data
+
+\singlespacing
+```{r}
+y <- rbind(
+  mvtnorm::rmvnorm(100, mean = c(0, 4), sigma = diag(2)),
+  mvtnorm::rmvnorm(100, mean = c(3, -2), sigma = diag(2)),
+  mvtnorm::rmvnorm(100, mean = c(-3, -2), sigma = diag(2))
+)
+tibble(
+  x = y[,1],
+  y = y[,2],
+  group = factor(rep(1:3, each = 100))
+) %>%
+  ggplot() + 
+  geom_point(aes(x = x, y = y, col = group)) + 
+  theme_bw() + 
+  labs(title = "Simulated data")
+
+data <- list(y = y)
+```
+\doublespacing
+
+## Fit model 2a
+
+\singlespacing
+```{r, eval = F}
+fit_mvndpm <- function(constants, data, inits, niter = 20000){
+  
+  # code
+  code <- nimbleCode({
+    # Dirichlet process parameters and group allocation
+    z[1:N] ~ dCRP(alpha, size = N)
+    alpha ~ dgamma(1, 1)
+
+    # table parameters
+    ## priors
+    Lambda0[1:d, 1:d] <- 10 * diag(d)
+    S0[1:d, 1:d] <- diag(d)
+    mu0[1:d] <- rep(0, d)
+    for(i in 1:M) {
+      theta[i, 1:d] ~ dmnorm(mu0[1:d], Lambda0[1:d, 1:d])
+      S[1:d, 1:d, i] ~ dwish(S0[1:d, 1:d], d)
+    }
+
+    # sampling model
+    for(i in 1:N){
+      y[i, 1:d] ~ dmnorm(theta[z[i], 1:d], S[1:d, 1:d, z[i]])
+    }
+  })
+
+  # R model
+  model <- nimbleModel(code, constants, data, inits)
+  
+  # C model
+  model_c <- compileNimble(model)
+  
+  # R mcmc
+  monitors <- c('z', 'theta', 'S' , 'alpha')
+  model_conf <- configureMCMC(model, monitors = monitors)
+  mcmc <- buildMCMC(model_conf)
+  
+  # C mcmc
+  mcmc_c <- compileNimble(mcmc)
+  
+  # run
+  mcmc_c$run(niter)
+  
+  # get samples
+  samples <- as.matrix(mcmc_c$mvSamples)
+  
+  # out
+  out <- list(samples = samples)
+  return(out)
+}
+constants <- list(N = nrow(data$y), d = ncol(data$y), M = 50)
+ex2a <- fit_mvndpm(
+  constants = constants,
+  data = data,
+  inits = list(
+    theta = mvtnorm::rmvnorm(constants$M, rep(0, constants$d), 10*diag(constants$d)),
+    S = sapply(rep(constants$d, constants$M), function(x) diag(1, nrow = x, ncol = x), simplify = "array"),
+    z = sample(1:10, size = nrow(data$y), replace = TRUE), 
+    alpha = 1
+  )
+)
+
+saveRDS(ex2a, file = "rds files/example 2/ex2a.rds")
+```
+\doublespacing
+
+# Gaussian processes
+
+## Gaussian process regression
+
+Sampling model:
+\[
+y \sim \mathcal{N}(X\beta, \Sigma) 
+\]
+where $\Sigma_{ij} = \sigma^2 \exp\left(-\frac{1}{2} \rho^2 d_{ij}^2 \right)$, where $d_{ij}$ is the distance between points $i$ and $j$.
+
+\singlespacing
+```{r, results = "hide", cache = F}
+# generate mvnorm in C++
+code <- '
+using namespace Rcpp;
+int n = as<int>(n_);
+arma::vec mu = as<arma::vec>(mu_);
+arma::mat sigma = as<arma::mat>(sigma_);
+int ncols = sigma.n_cols;
+arma::mat Y = arma::randn(n, ncols);
+return wrap(arma::repmat(mu, 1, n).t() + Y * arma::chol(sigma));
+'
+
+rmvnorm.rcpp <- cxxfunction(
+  signature(n_ = "integer", mu_ = "numeric", sigma_ = "matrix"), code,
+  plugin="RcppArmadillo", verbose=TRUE
+)
+
+distance <- function(x){
+  dist.vec <- parallelDist::parDist(x)
+  dist <- as.matrix(dist.vec)
+  return(dist)
+}
+
+expcov <- nimbleFunction(
+  run = function(dists = double(2), rho = double(0), sigma = double(0)) {
+    returnType(double(2))
+    n <- dim(dists)[1]
+    result <- matrix(nrow = n, ncol = n, init = FALSE)
+    sigma2 <- sigma*sigma
+    for(i in 1:n)
+      for(j in 1:n)
+        result[i, j] <- sigma2*exp(-dists[i,j]/rho)
+    return(result)
+  }
+)
+c.expcov <- compileNimble(expcov)
+
+dexpcov <- nimbleFunction(
+  run = function(dists = double(2), rho = double(0), sigma = double(0)) {
+    returnType(double(2))
+    n <- dim(dists)[1]
+    result <- matrix(nrow = n, ncol = n, init = FALSE)
+    sigma2 <- sigma*sigma
+    rho2 <- rho * rho
+    for(i in 1:n)
+      for(j in 1:n)
+        result[i, j] <- sigma2 * exp((-1/2) * rho2 * dists[i,j] * dists[i,j])
+    return(result)
+  }
+)
+c.dexpcov <- compileNimble(dexpcov)
+```
+
+### Simulate data
+
+```{r}
+set.seed(1)
+x <- seq(0, 10, length.out = 50)
+dist <- as.matrix(dist(x))
+Sigma <- dexpcov(dist, rho = max(dist)/2, sigma = 3)
+y <- 0 + x * 1 + c(rmvnorm.rcpp(1, rep(0, length(x)), Sigma))
+tibble(
+  y = y, 
+  x = x
+) %>%
+  ggplot() + 
+  geom_point(aes(x = x, y = y)) + 
+  theme_bw() + 
+  labs(title = "Simulated GPR data with rho = max(d)/2, sigma = 3, beta0 = 0, beta1 = 1")
+```
+
+### Fit model
+
+```{r, eval = F}
+fit_gpr <- function(constants, data, inits, niter = 5000){
+  
+  # code
+  code <- nimbleCode({
+    # regression coefficients
+    for(i in 1:p){
+      beta[i] ~ dnorm(0, sd = 10)
+    }
+
+    # spatial parameters
+    for(i in 1:n){
+      mu[i] <- beta[1] + beta[2] * x[i]
+    }
+    rho ~ dunif(0.2040816, 10)
+    sigma ~ T(dnorm(0, sd = 2), 0, Inf)
+    covmat[1:n, 1:n] <- dexpcov(
+      dists = dist[1:n, 1:n],
+      rho = rho,
+      sigma = sigma
+    )
+
+    # likelihood
+    y[1:n] ~ dmnorm(mu[1:n], cov = covmat[1:n, 1:n])
+  })
+  
+  # R model
+  model <- nimbleModel(code, constants, data, inits)
+  
+  # C model
+  model_c <- compileNimble(model)
+  
+  # R mcmc
+  monitors <- c("beta", "sigma", "rho")
+  model_conf <- configureMCMC(model, monitors = monitors)
+  # model_conf$removeSamplers("eta[1:400]")
+  # model_conf$addSampler("eta[1:400]", "RW_block", control = list(scale = 0.1))
+  mcmc <- buildMCMC(model_conf)
+  
+  # C mcmc
+  mcmc_c <- compileNimble(mcmc)
+  
+  # run
+  mcmc_c$run(niter)
+  
+  # get samples
+  samples <- as.matrix(mcmc_c$mvSamples)
+  
+  # out
+  out <- list(samples = samples)
+  return(out)
+}
+
+fit <- fit_gpr(
+  constants = list(
+    p = 2,
+    n = length(x)
+  ),
+  data = list(
+    y = y,
+    x = x,
+    dist = dist
+  ),
+  inits = list(
+    beta = rnorm(2),
+    rho = abs(rnorm(1)),
+    sigma = abs(rnorm(1, 2))
+  ),
+  niter = 10000
+)
+saveRDS(fit, file = "rds files/gpr/gpr_fit.rds")
+```
+
+```{r}
+fit <- readRDS("rds files/gpr/gpr_fit.rds")
+plot_tbl <- tibble(
+  parameter = factor(colnames(fit$samples), levels = colnames(fit$samples)),
+  mean = colMeans(fit$samples),
+  lwr = apply(fit$samples, 2, quantile, 0.025),
+  upr = apply(fit$samples, 2, quantile, 0.975),
+  truth = c(0, 1, max(dist)/2, 3), 
+  in_int = ifelse(lwr <= truth & upr >= truth, "yes", "no")
+)
+
+plot_tbl %>%
+  ggplot() + 
+  geom_pointrange(aes(x = parameter, y = mean, ymin = lwr, ymax = upr, col = in_int)) + 
+  geom_point(aes(x = parameter, y = truth), shape = 0) + 
+  coord_flip() + 
+  theme_bw() + 
+  labs(
+    title = "Posterior estimates for all parameters in GPR model"
+  )
+```
+
+\newpage
+# Occupancy
+## Multi-species occupancy
+
+**Simulate data**
+\singlespacing
+```{r}
+# housekeeping
+set.seed(1)
+nspecies <- 10
+p <- 2
+n <- 100
+j <- 15
+X <- cbind(
+  rep(1, n),
+  runif(n, 0, 1)
+)
+
+# parameters
+## site
+betas <- mvtnorm::rmvnorm(nspecies, mean = rep(0, p), sigma = diag(p))
+zmat <- matrix(0, n, nspecies)
+for(species in 1:nspecies){
+  tmp <- exp(X %*% betas[species, ])
+  zmat[,species] <- rbinom(n, 1, prob = tmp / (1 + tmp))
+}
+
+## visit
+alphas <- mvtnorm::rmvnorm(nspecies, mean = rep(0, p), sigma = diag(p))
+W <- array(0, dim = c(n, j, p))
+for(i in 1:(dim(W)[3])){
+  if(i == 1) {
+    W[,,i] <- 1
+  } else{
+    W[,,i] <- runif(n*j)
+  }
+}
+
+Y <- array(0, dim = c(n, max(j), nspecies))
+for(species in 1:nspecies){
+  for(site in 1:n){
+    for(visit in 1:j){
+      tmp <- exp(W[site, visit, ] %*% alphas[species,])
+      Y[site, visit, species] <- zmat[site, species] * rbinom(1, 1, tmp / (1 + tmp))
+    }
+  }
+}
+
+data <- list(Y = Y, W = W, X = X, nsites = n, nvisits = j, nspecies = nspecies, pocc = p, pdet = p)
+```
+\doublespacing
+
+**Fit model**
+
+\singlespacing
+```{r, eval = F}
+fit_msom <- function(constants, data, inits, niter = 5000){
+  
+  # code
+  code <- nimbleCode({
+    # hyper priors - clean this up
+    for(i in 1:pocc){
+      mu_occ[i] ~ dnorm(0, sd = 2)
+      sigma2_occ[i] ~ dinvgamma(1, 1)
+    }
+    for(i in 1:pdet){
+      mu_det[i] ~ dnorm(0, sd = 2)
+      sigma2_det[i] ~ dinvgamma(1, 1)
+    }
+    
+    # hierarchical coefficients - clean this up
+    for(species in 1:nspecies){
+      for(p in 1:pocc){
+        beta[species, p] ~ dnorm(mu_occ[p], var = sigma2_occ[p])
+      }
+    }
+    
+    for(species in 1:nspecies){
+      for(p in 1:pdet){
+        alpha[species, p] ~ dnorm(mu_det[p], var = sigma2_det[p])
+      }
+    }
+    
+    # sampling model 
+    for(species in 1:nspecies){
+      for(site in 1:nsites){
+        # latent occupancy state
+        logit(psi[site, species]) <- beta[species, 1] + beta[species, 2] * x[site]
+        z[site, species] ~ dbern(psi[site, species])
+        
+        # detection state
+        for(visit in 1:nvisits){
+          logit(p[site, visit, species]) <- alpha[species,1] + alpha[species, 2] * W[site, visit, 2]
+          Y[site, visit, species] ~ dbern(z[site, species] * p[site, visit, species])
+        }
+        
+      }
+    }
+    
+   
+  })
+  
+  # R model
+  model <- nimbleModel(code, constants, data, inits)
+  
+  # C model
+  model_c <- compileNimble(model)
+  
+  # R mcmc
+  monitors <- c("beta", "alpha", "mu_occ", "mu_det", "sigma2_occ", "sigma2_det")
+  model_conf <- configureMCMC(model, monitors = monitors)
+  mcmc <- buildMCMC(model_conf)
+  
+  # C mcmc
+  mcmc_c <- compileNimble(mcmc)
+  
+  # run
+  mcmc_c$run(niter)
+  
+  # get samples
+  samples <- as.matrix(mcmc_c$mvSamples)
+  
+  # out
+  out <- list(samples = samples)
+  return(out)
+}
+fit <- fit_msom(
+  constants = list(
+    pocc = data$pocc,
+    pdet = data$pdet,
+    nsites = data$nsites,
+    nvisits = data$nvisits,
+    nspecies = data$nspecies
+  ),
+  data = list(
+    Y = data$Y,
+    x = data$X[,2],
+    W = data$W
+  ),
+  inits = list(
+    mu_occ = rnorm(2),
+    sigma2_occ = rgamma(2, 1, 1),
+    mu_det = rnorm(2),
+    sigma2_occ = rgamma(2, 1, 1),
+    z = ifelse(apply(data$Y, 3, rowSums) == 0, 0 , 1)
+  )
+)
+saveRDS(fit, "rds files/msom/msom_fit.rds")
+```
+
+```{r}
+fit <- readRDS("rds files/msom/msom_fit.rds")
+fit$samples <- fit$samples[2501:5000,]
+plot_tbl <- tibble(
+  parameter = factor(colnames(fit$samples), levels = colnames(fit$samples)),
+  mean = colMeans(fit$samples),
+  lwr = apply(fit$samples, 2, quantile, 0.025),
+  upr = apply(fit$samples, 2, quantile, 0.975),
+  truth = c(c(alphas), c(betas), 0, 0, 0, 0, 1, 1, 1, 1), 
+  in_int = ifelse(lwr <= truth & upr >= truth, "yes", "no")
+)
+
+plot_tbl %>%
+  filter(grepl("alpha[[]", parameter)) %>%
+  ggplot() + 
+  geom_pointrange(aes(x = parameter, y = mean, ymin = lwr, ymax = upr, col = in_int)) + 
+  geom_point(aes(x = parameter, y = truth), shape = 0) + 
+  coord_flip() + 
+  theme_bw() + 
+  labs(
+    title = "Posterior estimates for detection level coefficients"
+  )
+
+plot_tbl %>%
+  filter(grepl("beta[[]", parameter)) %>%
+  ggplot() + 
+  geom_pointrange(aes(x = parameter, y = mean, ymin = lwr, ymax = upr, col = in_int)) + 
+  geom_point(aes(x = parameter, y = truth), shape = 0) + 
+  coord_flip() + 
+  theme_bw() + 
+  labs(
+    title = "Posterior estimates for occupancy level coefficients"
+  )
+```
+\doublespacing
+
+
+\newpage
+## Spatial single species occupancy
+
+\[
+\begin{split}
+Z_i &\sim \text{Bernoulli}(\psi_i) \\
+y_{ij} | z_i &\sim \text{Bernoulli}(z_i p_{ij})
+\end{split}
+\]
+where $\text{logit}(\psi_i) = x_i' \beta + \eta_i$, $\eta \sim \mathcal{N}(0, \Sigma)$, and $\Sigma_{ij} = \sigma^2 \exp\left(-frac{1}{2} \rho^2 d_{ij}^2\right)$ where $d_{ij}$ is the distance between sites $i$ and $j$.
+
+\singlespacing
+```{r, results = "hide", cache = F}
+# generate mvnorm in C++
+code <- '
+using namespace Rcpp;
+int n = as<int>(n_);
+arma::vec mu = as<arma::vec>(mu_);
+arma::mat sigma = as<arma::mat>(sigma_);
+int ncols = sigma.n_cols;
+arma::mat Y = arma::randn(n, ncols);
+return wrap(arma::repmat(mu, 1, n).t() + Y * arma::chol(sigma));
+'
+
+rmvnorm.rcpp <- cxxfunction(
+  signature(n_ = "integer", mu_ = "numeric", sigma_ = "matrix"), code,
+  plugin="RcppArmadillo", verbose=TRUE
+)
+
+distance <- function(x){
+  dist.vec <- parallelDist::parDist(x)
+  dist <- as.matrix(dist.vec)
+  return(dist)
+}
+
+expcov <- nimbleFunction(
+  run = function(dists = double(2), rho = double(0), sigma = double(0)) {
+    returnType(double(2))
+    n <- dim(dists)[1]
+    result <- matrix(nrow = n, ncol = n, init = FALSE)
+    sigma2 <- sigma*sigma
+    for(i in 1:n)
+      for(j in 1:n)
+        result[i, j] <- sigma2*exp(-dists[i,j]/rho)
+    return(result)
+  }
+)
+c.expcov <- compileNimble(expcov)
+
+dexpcov <- nimbleFunction(
+  run = function(dists = double(2), rho = double(0), sigma = double(0)) {
+    returnType(double(2))
+    n <- dim(dists)[1]
+    result <- matrix(nrow = n, ncol = n, init = FALSE)
+    sigma2 <- sigma*sigma
+    rho2 <- rho * rho
+    for(i in 1:n)
+      for(j in 1:n)
+        result[i, j] <- sigma2 * exp((-1/2) * (1/rho2) * dists[i,j] * dists[i,j])
+    return(result)
+  }
+)
+c.dexpcov <- compileNimble(dexpcov)
+
+clean_units <- function(x){
+  attr(x,"units") <- NULL
+  class(x) <- setdiff(class(x),"units")
+  x
+}
+```
+
+```{r}
+# create simulated region
+region_tmp <- st_make_grid(
+  x = st_polygon(list(matrix(c(0,0,40,0,40,40,0,40,0,0),ncol = 2, byrow = TRUE))),
+  cellsize = 1
+) %>%
+  st_as_sf() %>%
+  as_tibble() %>%
+  rename(geometry = x) %>%
+  st_as_sf()
+
+coords <- region_tmp %>%
+  select(geometry) %>%
+  st_centroid() %>%
+  st_coordinates()
+
+region <- region_tmp %>%
+  mutate(x = coords[,1], y = coords[,2]) %>%
+  mutate(elev = -1 * x + .75 * y - .05 * x * y + rnorm(n(), 0, .1)) %>%
+  mutate(elev = (elev - mean(elev)) / sd(elev))
+
+ggplot() + 
+  geom_sf(data = region, aes(geometry = geometry, fill = elev), size = .1) +
+  theme_bw() + 
+  labs(title = "Scaled elevation across region") + 
+  viridis::scale_fill_viridis(option = "magma")
+```
+
+```{r}
+# simulate data
+set.seed(03012021)
+j <- 15
+
+############
+### SITE ###
+############
+X <- cbind(
+  rep(1, nrow(region)),
+  region$elev
+)
+p_site <- ncol(X)
+betas <- matrix(c(0, 1), nrow = p_site)
+
+# spatial
+dist <- distance(coords)
+sigma <- 1.5
+rho <- 2.5
+Sigma <- c.dexpcov(dist, rho, sigma)
+
+# latent occupancy
+eta <- rmvnorm.rcpp(1, rep(0, nrow(region)), Sigma + .0001 * diag(nrow(region)))
+bind_cols(region, eta = c(eta)) %>%
+  ggplot() + 
+  geom_sf(aes(geometry = geometry, fill = eta), size = .1) +
+  theme_bw() + 
+  labs(title = "Spatial random effects across region") + 
+  viridis::scale_fill_viridis(option = "magma")
+
+psi <- exp(X %*% betas + c(eta)) / (1 + exp(X %*% betas + c(eta)))
+bind_cols(region, psi = c(psi)) %>%
+  ggplot() + 
+  geom_sf(aes(geometry = geometry, fill = psi), size = .1) +
+  theme_bw() + 
+  labs(title = "Psi across region") + 
+  viridis::scale_fill_viridis(option = "magma", limits = c(0,1))
+
+z <- rbinom(nrow(region), 1, psi)
+bind_cols(region, z = factor(z)) %>%
+  ggplot() + 
+  geom_sf(aes(geometry = geometry, fill = z), size = .1) +
+  theme_bw() + 
+  labs(title = "Z across region")
+
+#############
+### VISIT ###
+#############
+p_rep <- 2
+alphas <- matrix(c(0, 1), ncol = 1)
+W <- array(0, dim = c(nrow(region), j, p_rep))
+for(i in 1:(dim(W)[3])){
+  if(i == 1) {
+    W[,,i] <- 1
+  } else{
+    W[,,i] <- rnorm(nrow(region)*j)
+  }
+}
+
+Y <- matrix(0, nrow(region), j)
+p <- matrix(0, nrow(region), j)
+
+for(i in 1:nrow(region)){
+  for(k in 1:j){
+    tmp <- alphas[1,1] * W[i,k,1] + alphas[2,1] * W[i,k,2]
+    p[i,k] <- exp(tmp) / (1 + exp(tmp))
+    Y[i,k] <- rbinom(1, 1, z[i] * p[i,k])
+  }
+}
+
+##############
+### Sample ###
+##############
+n <- 1600
+index <- sort(sample(1:nrow(region), size = n, replace = FALSE))
+dist_ <- distance(coords[index,])
+data <- list(
+  Y = Y[index,], 
+  W = W[index,,], 
+  X = X[index,], 
+  nsites = n, 
+  nvisits = j, 
+  pocc = p_site, 
+  pdet = p_rep,
+  dist = dist_
+)
+
+bind_cols(region, z = factor(z)) %>%
+  slice(index) %>%
+  ggplot() + 
+  geom_sf(aes(geometry = geometry, fill = z), size = .1) +
+  theme_bw() + 
+  labs(title = "Latent Z state across observed region") 
+
+saveRDS(data, file = "rds files/spom/spom_data.rds")
+```
+
+```{r, eval = F}
+data <- readRDS("rds files/spom/spom_data.rds")
+fit_spom <- function(constants, data, inits, niter = 5000, nchains = 3){
+  
+  # code
+  code <- nimbleCode({
+    # regression coefficients
+    for(i in 1:pocc){
+      beta[i] ~ dnorm(0, sd = 2)
+    }
+    for(i in 1:pdet){
+      alpha[i] ~ dnorm(0, sd = 2)
+    }
+
+    # spatial parameters
+    mu0 ~ dnorm(0, sd = 10)
+    rho ~ dunif(.1, rho_upr)
+    sigma ~ T(dnorm(0, sd = 2), 0, Inf)
+    
+    # spatial random effects
+    covmat[1:nsites, 1:nsites] <- dexpcov(
+      dists = dist[1:nsites, 1:nsites],
+      rho = rho,
+      sigma = sigma
+    )
+    mu[1:nsites] <- mu0 * ones[1:nsites]
+    eta[1:nsites] ~ dmnorm(mu[1:nsites], cov = covmat[1:nsites, 1:nsites])
+
+    # likelihood
+    for(site in 1:nsites){
+      logit(psi[site]) <- beta[1] + beta[2] * x[site] + eta[site]
+      z[site] ~ dbern(psi[site])
+      
+      for(visit in 1:nvisits){
+        logit(p[site, visit]) <- alpha[1] + alpha[2] * W[site, visit, 2]
+        Y[site, visit] ~ dbern(z[site] * p[site, visit])
+      }
+    }
+  })
+  
+  # R model
+  model <- nimbleModel(code, constants, data, inits)
+  
+  # C model
+  model_c <- compileNimble(model)
+  
+  # R mcmc
+  monitors <- c("beta", "alpha", "sigma", "rho")
+  model_conf <- configureMCMC(model, monitors = monitors)
+  model_conf$removeSamplers("eta[1:400]")
+  model_conf$addSampler("eta[1:400]", "RW_block", control = list(scale = 0.15))
+  mcmc <- buildMCMC(model_conf)
+  
+  # C mcmc
+  mcmc_c <- compileNimble(mcmc)
+  
+  # run
+  tmp <- runMCMC(mcmc_c, niter = niter, nchains = nchains)
+  
+  # # run
+  # mcmc_c$run(niter)
+  # 
+  # # get samples
+  # samples <- as.matrix(mcmc_c$mvSamples)
+  
+  # out
+  # out <- list(samples = samples)
+  out <- list(samples = tmp)
+  return(out)
+}
+
+init_function <- function(data){
+  list(
+    z = apply(data$Y, 1, function(x) ifelse(sum(x) == 0, 0, 1)),
+    alpha = rnorm(2),
+    beta = rnorm(2),
+    rho = runif(1, .1, 5),
+    sigma = abs(rnorm(1, 0, sd = 2)),
+    mu0 = 0
+  )
+}
+
+detach("package:nimble", unload = TRUE)
+suppressMessages(library(nimble))
+fit <- fit_spom(
+  constants = list(
+    pocc = data$pocc,
+    pdet = data$pdet,
+    nsites = data$nsites,
+    nvisits = data$nvisits,
+    rho_upr = max(dist)/2
+  ),
+  data = list(
+    Y = data$Y,
+    x = data$X[,2],
+    W = data$W,
+    ones = rep(1, nrow(data$X)),
+    dist = data$dist
+  ),
+  inits = init_function(data),
+  niter = 5000,
+  nchains = 3
+)
+saveRDS(fit, "rds files/spom/spom_fit.rds")
+```
+
+```{r, eval = T}
+# load samples
+fit <- readRDS("rds files/spom/spom_fit.rds")
+
+# traceplots
+par(mfrow = c(3, 2))
+for(i in 1:ncol(fit$samples[[1]])){
+  plot(
+    1, type = "n", 
+    ylim = range(sapply(fit$samples, function(x) range(x[,i]))),
+    xlim = c(1, nrow(fit$samples[[1]])),
+    ylab = "estimate",
+    xlab = "iteration",
+    main = colnames(fit$samples[[1]])[i]
+  )
+  for(chain in 1:length(fit$samples)){
+    lines(fit$samples[[chain]][,i], col = chain)
+  }
+}
+
+# fit$samples <- fit$samples[5001:10000,]
+# plot_tbl <- tibble(
+#   parameter = factor(colnames(fit$samples), levels = colnames(fit$samples)),
+#   mean = colMeans(fit$samples),
+#   lwr = apply(fit$samples, 2, quantile, 0.025),
+#   upr = apply(fit$samples, 2, quantile, 0.975),
+#   truth = c(c(alphas), c(betas), rho, sigma), 
+#   in_int = ifelse(lwr <= truth & upr >= truth, "yes", "no")
+# )
+```
+\doublespacing
+
+\newpage
+
+## Spatial multispecies occupancy
+
+Fix prec vs cov
+
+\singlespacing
+
+```{r, fig.dim = c(10, 10)}
+# spatial data
+mt <- readRDS("rds files/spmsom/mt.rds") %>%
+  mutate(elev_sc = (mean_elevation - mean(mean_elevation)) / sd(mean_elevation)) %>%
+  st_as_sf() %>%
+  st_transform(crs = 26911) # UTM 11N - projected coordinate reference system for nice euclidean distances
+ggplot() + 
+  geom_sf(data = mt, aes(geometry = geometry, fill = elev_sc), size = .1) +
+  theme_bw() + 
+  labs(title = "Scaled elevation across Montana", subtitle = "NAD83 / UTM 11N") + 
+  viridis::scale_fill_viridis(option = "magma")
+
+# simulate data
+## housekeeping
+set.seed(1)
+nspecies <- 15
+p <- 2
+j <- 20
+
+############
+### SITE ###
+############
+X <- cbind(
+  rep(1, nrow(mt)), 
+  mt$elev_sc
+)
+betas <- mvtnorm::rmvnorm(nspecies, mean = rep(0, p), sigma = .5 * diag(p))
+zmat <- matrix(0, nrow(mt), nspecies)
+psi <- matrix(0, nrow(mt), nspecies)
+
+# spatial
+coords <- mt %>%
+  select(geometry) %>%
+  st_centroid() %>%
+  st_transform(4326) %>%
+  st_coordinates()
+dist <- distance(coords)
+sigma <- abs(rnorm(nspecies))
+rho <- MCMCpack::rinvgamma(nspecies, 1, 1)
+Sigma.k <- sapply(1:nspecies, function(x) c.expcov(dist, rho[x], sigma[x]), simplify = "array")
+eta <- sapply(1:nspecies, function(x) rmvnorm.rcpp(1, rep(0, nrow(mt)), Sigma.k[,,x]))
+
+# latent state
+for(species in 1:nspecies){
+  tmp <- exp(X %*% betas[species, ] + eta[,species])
+  psi[,species] <- tmp / (1 + tmp)
+  zmat[,species] <- rbinom(nrow(mt), 1, prob = c(psi[,species]))
+}
+
+colnames(psi) <- paste0("psi_", 1:nspecies)
+plots <- list()
+for(i in 1:nspecies){
+  plots[[i]] <- bind_cols(mt, as.data.frame(psi)) %>%
+  ggplot() + 
+  geom_sf(aes_string(geometry = "geometry", fill = paste0("psi_", i)), size = .05) + 
+  theme_bw() + 
+  labs(title = paste0("Psi for species ", i), subtitle = "NAD83 / UTM 11N") + 
+  viridis::scale_fill_viridis(option = "magma", limits = c(0, 1)) 
+}
+do.call(eval(parse(text="gridExtra::grid.arrange")), c(plots, ncol = floor(sqrt(length(plots)))))
+
+#############
+### VISIT ###
+#############
+
+alphas <- mvtnorm::rmvnorm(nspecies, mean = rep(0, p), sigma = diag(p))
+W <- array(0, dim = c(nrow(mt), j, p))
+for(i in 1:(dim(W)[3])){
+  if(i == 1) {
+    W[,,i] <- 1
+  } else{
+    W[,,i] <- rnorm(nrow(mt)*j)
+  }
+}
+
+Y <- array(0, dim = c(nrow(mt), max(j), nspecies))
+prob <- array(0, dim = c(nrow(mt), max(j), nspecies))
+for(species in 1:nspecies){
+  for(site in 1:nrow(mt)){
+    for(visit in 1:j){
+      tmp <- exp(W[site, visit, ] %*% alphas[species,])
+      prob[site, visit, species] <- tmp / (1 + tmp)
+      Y[site, visit, species] <- zmat[site, species] * rbinom(1, 1, prob[site, visit, species])
+    }
+  }
+}
+
+##############
+### Sample ###
+##############
+n <- 500
+index <- sort(sample(1:nrow(mt), size = n, replace = FALSE))
+data <- list(
+  Y = Y[index,,], 
+  W = W[index,,], 
+  X = X[index,], 
+  nsites = n, 
+  nvisits = j, 
+  nspecies = nspecies, 
+  pocc = p, 
+  pdet = p,
+  dist = dist
+)
+saveRDS(data, file = "rds files/spmsom/spmsom_data.rds")
+```
+
+```{r, eval = F}
+data <- readRDS("rds files/spmsom/spmsom_data.rds")
+fit_spmsom <- function(constants, data, inits, niter = 5000){
+  
+  # code
+  code <- nimbleCode({
+    # hyper priors
+    for(i in 1:pocc){
+      mu_occ[i] ~ dnorm(0, sd = 2)
+      sigma2_occ[i] ~ dinvgamma(1, 1)
+    }
+    for(i in 1:pdet){
+      mu_det[i] ~ dnorm(0, sd = 2)
+      sigma2_det[i] ~ dinvgamma(1, 1)
+    }
+    
+    # spatial parameters
+    for(species in 1:nspecies){
+      rho[species] ~ dinvgamma(.1, 1)
+      sigma[species] ~ T(dnorm(0, sd = 1), 0, Inf)
+    }
+    
+    # hierarchical coefficients 
+    for(species in 1:nspecies){
+      for(p in 1:pocc){
+        beta[species, p] ~ dnorm(mu_occ[p], var = sigma2_occ[p])
+      }
+    }
+    
+    for(species in 1:nspecies){
+      for(p in 1:pdet){
+        alpha[species, p] ~ dnorm(mu_det[p], var = sigma2_det[p])
+      }
+    }
+    
+    # sampling model 
+    for(species in 1:nspecies){
+      # covariance matrix 
+      covmat[1:nsites, 1:nsites, species] <- expcov(
+        dists = dist[1:nsites, 1:nsites], 
+        rho = rho[species], 
+        sigma = sigma[species]
+      )
+      eta[1:nsites, species] ~ dmnorm(zeroes[1:nsites], covmat[1:nsites, 1:nsites, species])
+      
+      # loop through sites
+      for(site in 1:nsites){
+        # latent occupancy state
+        logit(psi[site, species]) <- beta[species, 1] + beta[species, 2] * x[site] + eta[site, species]
+        z[site, species] ~ dbern(psi[site, species])
+        
+        # detection state
+        for(visit in 1:nvisits){
+          logit(p[site, visit, species]) <- alpha[species,1] + alpha[species, 2] * W[site, visit, 2]
+          Y[site, visit, species] ~ dbern(z[site, species] * p[site, visit, species])
+        }
+        
+      }
+    }
+    
+   
+  })
+  
+  # R model
+  model <- nimbleModel(code, constants, data, inits)
+  
+  # C model
+  model_c <- compileNimble(model)
+  
+  # R mcmc
+  monitors <- c("beta", "alpha", "mu_occ", "mu_det", "sigma2_occ", "sigma2_det", "sigma", "rho")
+  model_conf <- configureMCMC(model, monitors = monitors)
+  mcmc <- buildMCMC(model_conf)
+  
+  # C mcmc
+  mcmc_c <- compileNimble(mcmc)
+  
+  # run
+  mcmc_c$run(niter)
+  
+  # get samples
+  samples <- as.matrix(mcmc_c$mvSamples)
+  
+  # out
+  out <- list(samples = samples)
+  return(out)
+}
+fit <- fit_spmsom(
+  constants = list(
+    pocc = data$pocc,
+    pdet = data$pdet,
+    nsites = data$nsites,
+    nvisits = data$nvisits,
+    nspecies = data$nspecies
+  ),
+  data = list(
+    Y = data$Y,
+    x = data$X[,2],
+    W = data$W,
+    zeroes = rep(0, nrow(data$Y)),
+    dist = data$dist
+  ),
+  inits = list(
+    mu_occ = rnorm(2),
+    sigma2_occ = rgamma(2, 1, 1),
+    mu_det = rnorm(2),
+    sigma2_occ = rgamma(2, 1, 1),
+    z = ifelse(apply(data$Y, 3, rowSums) == 0, 0, 1),
+    rho = MCMCpack::rinvgamma(15, .1, 1),
+    sigma = abs(rnorm(15))
+  ),
+  niter = 10000
+)
+saveRDS(fit, "rds files/spmsom/spmsom_fit.rds")
+```
+
+```{r, eval = F}
+fit <- readRDS("rds files/spmsom/spmsom_fit.rds")
+fit$samples <- fit$samples[5001:10000,]
+plot_tbl <- tibble(
+  parameter = factor(colnames(fit$samples), levels = colnames(fit$samples)),
+  mean = colMeans(fit$samples),
+  lwr = apply(fit$samples, 2, quantile, 0.025),
+  upr = apply(fit$samples, 2, quantile, 0.975),
+  truth = c(c(alphas), c(betas), 0, 0, 0, 0, c(rho), c(sigma), 1, 1, .5^2, .5^2), 
+  in_int = ifelse(lwr <= truth & upr >= truth, "yes", "no")
+)
+
+plot_tbl %>%
+  filter(grepl("alpha[[]", parameter)) %>%
+  ggplot() + 
+  geom_pointrange(aes(x = parameter, y = mean, ymin = lwr, ymax = upr, col = in_int)) + 
+  geom_point(aes(x = parameter, y = truth), shape = 0) + 
+  coord_flip() + 
+  theme_bw() + 
+  labs(
+    title = "Posterior estimates for detection level coefficients"
+  )
+
+plot_tbl %>%
+  filter(grepl("beta[[]", parameter)) %>%
+  ggplot() + 
+  geom_pointrange(aes(x = parameter, y = mean, ymin = lwr, ymax = upr, col = in_int)) + 
+  geom_point(aes(x = parameter, y = truth), shape = 0) + 
+  coord_flip() + 
+  theme_bw() + 
+  labs(
+    title = "Posterior estimates for occupancy level coefficients"
+  )
+
+plot_tbl %>%
+  filter(grepl("rho[[]", parameter)) %>%
+  ggplot() + 
+  geom_pointrange(aes(x = parameter, y = mean, ymin = lwr, ymax = upr, col = in_int)) + 
+  geom_point(aes(x = parameter, y = truth), shape = 0) + 
+  coord_flip() + 
+  theme_bw() + 
+  labs(
+    title = "Posterior estimates for rho"
+  )
+
+plot_tbl %>%
+  filter(grepl("sigma[[]", parameter)) %>%
+  ggplot() + 
+  geom_pointrange(aes(x = parameter, y = mean, ymin = lwr, ymax = upr, col = in_int)) + 
+  geom_point(aes(x = parameter, y = truth), shape = 0) + 
+  coord_flip() + 
+  theme_bw() + 
+  labs(
+    title = "Posterior estimates for sigma"
+  )
+```
+
+\newpage
+\singlespacing
+# References
