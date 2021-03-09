@@ -212,10 +212,19 @@ We begin by fitting an infinite mixture model to a mixture of univariate normal 
 
 ## Simulate data
 
-First, we simulate data from a univariate normal mixture.
+We first simulate data from a univariate normal mixture. 
+
+\[
+\begin{split}
+y_i &\sim \text{normal}(\mu_{c_i}, \sigma_{c_i}) \\
+c_i &\sim \text{multinomial}(\pi)
+\end{split}
+\]
+
+In this case, we assume $\boldsymbol{\mu} = \{-5,0, 5\}$, $\boldsymbol{\sigma} = \{1.5, 1, 1.5\}$ and $\boldsymbol{\pi} = \{1/3, 1/3, 1/3\}$
 
 \singlespacing
-```{r, eval = T}
+```{r, eval = T, echo = F}
 set.seed(01082021)
 data <- list(y = sample(c(
   rnorm(100, -5, 1.5), rnorm(100, 0, 1), rnorm(100, 5, 1.5)
@@ -234,7 +243,13 @@ ggplot() +
 
 ### Raw model fit
 
-Next we fit the model and visualize the raw MCMC results, placing a $\text{gamma}(1,1)$ prior on $\alpha$.
+Next we fit the infinite mixture model and visualize the raw MCMC results, placing a $\text{gamma}(1,1)$ prior on $\alpha$. Formally, the model is
+
+\[
+\begin{split}
+y_i | \mu_i, \sigma_i
+\end{split}
+\]
 
 \singlespacing
 ```{r, messages = F, eval = F}
@@ -983,10 +998,10 @@ Z_i &\sim \text{Bernoulli}(\psi_i) \\
 y_{ij} | z_i &\sim \text{Bernoulli}(z_i p_{ij})
 \end{split}
 \]
-where $\text{logit}(\psi_i) = x_i' \beta + \eta_i$, $\eta \sim \mathcal{N}(0, \Sigma)$, and $\Sigma_{ij} = \sigma^2 \exp\left(-frac{1}{2} \rho^2 d_{ij}^2\right)$ where $d_{ij}$ is the distance between sites $i$ and $j$.
+where $\text{logit}(\psi_i) = x_i' \beta + \eta_i$, $\boldsymbol{\eta} \sim \mathcal{N}(0, \Sigma)$, and $\Sigma_{ij} = \sigma^2 \exp\left(-\frac{1}{2\rho^2} ||\boldsymbol{s}_i - \boldsymbol{s}_j||^2\right)$.
 
 \singlespacing
-```{r, results = "hide", cache = F}
+```{r, results = "hide", cache = F, echo = F}
 # generate mvnorm in C++
 code <- '
 using namespace Rcpp;
@@ -1045,10 +1060,10 @@ clean_units <- function(x){
 }
 ```
 
-```{r}
+```{r, echo = F}
 # create simulated region
 region_tmp <- st_make_grid(
-  x = st_polygon(list(matrix(c(0,0,40,0,40,40,0,40,0,0),ncol = 2, byrow = TRUE))),
+  x = st_polygon(list(matrix(c(0,0,30,0,30,30,0,30,0,0),ncol = 2, byrow = TRUE))),
   cellsize = 1
 ) %>%
   st_as_sf() %>%
@@ -1073,9 +1088,9 @@ ggplot() +
   viridis::scale_fill_viridis(option = "magma")
 ```
 
-```{r}
+```{r, echo = F}
 # simulate data
-set.seed(03012021)
+set.seed(03092021)
 j <- 15
 
 ############
@@ -1091,16 +1106,16 @@ betas <- matrix(c(0, 1), nrow = p_site)
 # spatial
 dist <- distance(coords)
 sigma <- 1.5
-rho <- 2.5
+rho <- 2
 Sigma <- c.dexpcov(dist, rho, sigma)
 
 # latent occupancy
-eta <- rmvnorm.rcpp(1, rep(0, nrow(region)), Sigma + .0001 * diag(nrow(region)))
+eta <- rmvnorm.rcpp(1, rep(0, nrow(region)), Sigma)
 bind_cols(region, eta = c(eta)) %>%
   ggplot() + 
   geom_sf(aes(geometry = geometry, fill = eta), size = .1) +
   theme_bw() + 
-  labs(title = "Spatial random effects across region") + 
+  labs(title = "Spatial random across region") + 
   viridis::scale_fill_viridis(option = "magma")
 
 psi <- exp(X %*% betas + c(eta)) / (1 + exp(X %*% betas + c(eta)))
@@ -1146,7 +1161,7 @@ for(i in 1:nrow(region)){
 ##############
 ### Sample ###
 ##############
-n <- 1600
+n <- 900
 index <- sort(sample(1:nrow(region), size = n, replace = FALSE))
 dist_ <- distance(coords[index,])
 data <- list(
@@ -1170,14 +1185,14 @@ bind_cols(region, z = factor(z)) %>%
 saveRDS(data, file = "rds files/spom/spom_data.rds")
 ```
 
-```{r, eval = F}
+```{r, eval = F, echo = F}
 data <- readRDS("rds files/spom/spom_data.rds")
 fit_spom <- function(constants, data, inits, niter = 5000, nchains = 3){
   
   # code
   code <- nimbleCode({
     # regression coefficients
-    for(i in 1:pocc){
+    for(i in 1:(pocc-1)){
       beta[i] ~ dnorm(0, sd = 2)
     }
     for(i in 1:pdet){
@@ -1185,11 +1200,11 @@ fit_spom <- function(constants, data, inits, niter = 5000, nchains = 3){
     }
 
     # spatial parameters
-    mu0 ~ dnorm(0, sd = 10)
+    mu0 ~ dnorm(0, sd = 2)
     rho ~ dunif(.1, rho_upr)
     sigma ~ T(dnorm(0, sd = 2), 0, Inf)
     
-    # spatial random effects
+    # spatial mean
     covmat[1:nsites, 1:nsites] <- dexpcov(
       dists = dist[1:nsites, 1:nsites],
       rho = rho,
@@ -1200,7 +1215,7 @@ fit_spom <- function(constants, data, inits, niter = 5000, nchains = 3){
 
     # likelihood
     for(site in 1:nsites){
-      logit(psi[site]) <- beta[1] + beta[2] * x[site] + eta[site]
+      logit(psi[site]) <- beta[1] * x[site] + eta[site]
       z[site] ~ dbern(psi[site])
       
       for(visit in 1:nvisits){
@@ -1219,8 +1234,21 @@ fit_spom <- function(constants, data, inits, niter = 5000, nchains = 3){
   # R mcmc
   monitors <- c("beta", "alpha", "sigma", "rho")
   model_conf <- configureMCMC(model, monitors = monitors)
-  model_conf$removeSamplers("eta[1:400]")
-  model_conf$addSampler("eta[1:400]", "RW_block", control = list(scale = 0.15))
+  
+  # customize MCMC
+  ##use AFSS? https://r-nimble.org/better-block-sampling-in-mcmc-with-the-automated-factor-slice-sampler
+  model_conf$removeSamplers(c("rho", "sigma"))
+  # model_conf$addSampler(
+  #   target = c("rho", "sigma"),
+  #   type = "AF_slice", 
+  # )
+  model_conf$addSampler(
+    target = c("rho", "sigma"),
+    type = "RW_block",
+    control = list(
+      scale = .15
+    )
+  )
   mcmc <- buildMCMC(model_conf)
   
   # C mcmc
@@ -1229,14 +1257,7 @@ fit_spom <- function(constants, data, inits, niter = 5000, nchains = 3){
   # run
   tmp <- runMCMC(mcmc_c, niter = niter, nchains = nchains)
   
-  # # run
-  # mcmc_c$run(niter)
-  # 
-  # # get samples
-  # samples <- as.matrix(mcmc_c$mvSamples)
-  
-  # out
-  # out <- list(samples = samples)
+  # return
   out <- list(samples = tmp)
   return(out)
 }
@@ -1245,7 +1266,7 @@ init_function <- function(data){
   list(
     z = apply(data$Y, 1, function(x) ifelse(sum(x) == 0, 0, 1)),
     alpha = rnorm(2),
-    beta = rnorm(2),
+    beta = rnorm(1),
     rho = runif(1, .1, 5),
     sigma = abs(rnorm(1, 0, sd = 2)),
     mu0 = 0
@@ -1266,17 +1287,17 @@ fit <- fit_spom(
     Y = data$Y,
     x = data$X[,2],
     W = data$W,
-    ones = rep(1, nrow(data$X)),
-    dist = data$dist
+    dist = data$dist,
+    ones = rep(1, nrow(data$X))
   ),
   inits = init_function(data),
-  niter = 5000,
+  niter = 30000,
   nchains = 3
 )
-saveRDS(fit, "rds files/spom/spom_fit.rds")
+saveRDS(fit, "rds files/spom/spom_fit_blockrhosigma.rds")
 ```
 
-```{r, eval = T}
+```{r, eval = T, echo = F}
 # load samples
 fit <- readRDS("rds files/spom/spom_fit.rds")
 
