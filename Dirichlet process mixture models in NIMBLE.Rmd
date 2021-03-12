@@ -20,7 +20,7 @@ csl: biometrics_notes.csl
 rm(list = ls())
 
 # packages
-packs <- c("dplyr", "nimble", "htmltools", "ggplot2", "sf", "Rcpp", "RcppArmadillo", "inline", "mvtnorm")
+packs <- c("dplyr", "nimble", "htmltools", "ggplot2", "sf", "Rcpp", "RcppArmadillo", "inline", "mvtnorm", "parallel")
 sapply(packs, require, character.only = T)
 rm(packs)
 
@@ -28,6 +28,7 @@ rm(packs)
 library(htmltools)
 knitr::opts_chunk$set(
   fig.align = "center"
+  
 )
 knitr::knit_hooks$set(imgcenter = function(before, options, envir){
   if (before) {
@@ -1035,6 +1036,7 @@ expcov <- nimbleFunction(
         result[i, j] <- sigma2*exp(-dists[i,j]/rho)
     return(result)
   }
+  
 )
 c.expcov <- compileNimble(expcov)
 
@@ -1060,10 +1062,10 @@ clean_units <- function(x){
 }
 ```
 
-```{r, echo = F}
+```{r, echo = F, include = F}
 # create simulated region
 region_tmp <- st_make_grid(
-  x = st_polygon(list(matrix(c(0,0,30,0,30,30,0,30,0,0),ncol = 2, byrow = TRUE))),
+  x = st_polygon(list(matrix(c(0,0,14,0,14,14,0,14,0,0),ncol = 2, byrow = TRUE))),
   cellsize = 1
 ) %>%
   st_as_sf() %>%
@@ -1090,8 +1092,8 @@ ggplot() +
 
 ```{r, echo = F}
 # simulate data
-set.seed(03092021)
-j <- 15
+set.seed(03132021)
+j <- 20
 
 ############
 ### SITE ###
@@ -1105,12 +1107,12 @@ betas <- matrix(c(0, 1), nrow = p_site)
 
 # spatial
 dist <- distance(coords)
-sigma <- 1.5
+sigma <- 3
 rho <- 2
 Sigma <- c.dexpcov(dist, rho, sigma)
 
 # latent occupancy
-eta <- rmvnorm.rcpp(1, rep(0, nrow(region)), Sigma)
+eta <- t(rmvnorm.rcpp(1, rep(0, nrow(region)), Sigma))
 bind_cols(region, eta = c(eta)) %>%
   ggplot() + 
   geom_sf(aes(geometry = geometry, fill = eta), size = .1) +
@@ -1118,7 +1120,8 @@ bind_cols(region, eta = c(eta)) %>%
   labs(title = "Spatial random across region") + 
   viridis::scale_fill_viridis(option = "magma")
 
-psi <- exp(X %*% betas + c(eta)) / (1 + exp(X %*% betas + c(eta)))
+# psi <- exp(X %*% betas + c(eta)) / (1 + exp(X %*% betas + c(eta)))
+psi <- exp(c(eta)) / (1 + exp(c(eta)))
 bind_cols(region, psi = c(psi)) %>%
   ggplot() + 
   geom_sf(aes(geometry = geometry, fill = psi), size = .1) +
@@ -1161,7 +1164,7 @@ for(i in 1:nrow(region)){
 ##############
 ### Sample ###
 ##############
-n <- 900
+n <- 14^2
 index <- sort(sample(1:nrow(region), size = n, replace = FALSE))
 dist_ <- distance(coords[index,])
 data <- list(
@@ -1187,14 +1190,43 @@ saveRDS(data, file = "rds files/spom/spom_data.rds")
 
 ```{r, eval = F, echo = F}
 data <- readRDS("rds files/spom/spom_data.rds")
-fit_spom <- function(constants, data, inits, niter = 5000, nchains = 3){
+fit_spom <- function(seed, parallel = F, constants, data, inits, niter = 5000, nchains = 3, thin = 1){
+  
+  # for parallel
+  suppressMessages(library(nimble))
+  dexpcov <- nimbleFunction(
+    run = function(dists = double(2), rho = double(0), sigma = double(0)) {
+      returnType(double(2))
+      n <- dim(dists)[1]
+      result <- matrix(nrow = n, ncol = n, init = FALSE)
+      sigma2 <- sigma*sigma
+      rho2 <- rho * rho
+      for(i in 1:n)
+        for(j in 1:n)
+          result[i, j] <- sigma2 * exp((-1/2) * (1/rho2) * dists[i,j] * dists[i,j])
+      return(result)
+    }
+  )
+  assign("dexpcov", dexpcov, envir = .GlobalEnv)
+  
+  # inits
+  init_function <- function(data){
+    list(
+      z = apply(data$Y, 1, function(x) ifelse(sum(x) == 0, 0, 1)),
+      alpha = rnorm(2),
+      # beta = rnorm(1),
+      rho = 2,
+      sigma = 3,
+      mu0 = 0
+    )
+  }
   
   # code
   code <- nimbleCode({
     # regression coefficients
-    for(i in 1:(pocc-1)){
-      beta[i] ~ dnorm(0, sd = 2)
-    }
+    # for(i in 1:(pocc-1)){
+    #   beta[i] ~ dnorm(0, sd = 2)
+    # }
     for(i in 1:pdet){
       alpha[i] ~ dnorm(0, sd = 2)
     }
@@ -1202,7 +1234,7 @@ fit_spom <- function(constants, data, inits, niter = 5000, nchains = 3){
     # spatial parameters
     mu0 ~ dnorm(0, sd = 2)
     rho ~ dunif(.1, rho_upr)
-    sigma ~ T(dnorm(0, sd = 2), 0, Inf)
+    sigma ~ T(dnorm(0, sd = 3), 0, Inf)
     
     # spatial mean
     covmat[1:nsites, 1:nsites] <- dexpcov(
@@ -1215,7 +1247,8 @@ fit_spom <- function(constants, data, inits, niter = 5000, nchains = 3){
 
     # likelihood
     for(site in 1:nsites){
-      logit(psi[site]) <- beta[1] * x[site] + eta[site]
+      # logit(psi[site]) <- beta[1] * x[site] + eta[site]
+      logit(psi[site]) <- eta[site]
       z[site] ~ dbern(psi[site])
       
       for(visit in 1:nvisits){
@@ -1226,28 +1259,49 @@ fit_spom <- function(constants, data, inits, niter = 5000, nchains = 3){
   })
   
   # R model
+  if(parallel){
+    inits <- init_function(data)
+  }
   model <- nimbleModel(code, constants, data, inits)
   
   # C model
   model_c <- compileNimble(model)
   
   # R mcmc
-  monitors <- c("beta", "alpha", "sigma", "rho")
+  # monitors <- c("beta", "alpha", "sigma", "rho", "mu0")
+  monitors <- c("alpha", "sigma", "rho", "mu0")
   model_conf <- configureMCMC(model, monitors = monitors)
   
   # customize MCMC
+  # model_conf$removeSampler(c("rho", "sigma"))
+  # model_conf$addSampler(
+  #   target = c("rho", "sigma"),
+  #   type = "RW_block",
+  #   control = list(
+  #     scale = .05
+  #   )
+  # )
   ##use AFSS? https://r-nimble.org/better-block-sampling-in-mcmc-with-the-automated-factor-slice-sampler
   model_conf$removeSamplers(c("rho", "sigma"))
   # model_conf$addSampler(
   #   target = c("rho", "sigma"),
-  #   type = "AF_slice", 
+  #   type = "AF_slice",
+  #   control = list(
+  #     sliceAdaptFactorInterval = 200,
+  #     sliceWidths = c(2, 2)
+  #   )
   # )
+  model_conf$removeSamplers(c("eta[1:96]"))
   model_conf$addSampler(
-    target = c("rho", "sigma"),
+    target = "eta[1:196]",
     type = "RW_block",
     control = list(
       scale = .15
     )
+  )
+  model_conf$addSampler(
+    target = c("rho", "sigma"),
+    type = "AF_slice",
   )
   mcmc <- buildMCMC(model_conf)
   
@@ -1255,27 +1309,58 @@ fit_spom <- function(constants, data, inits, niter = 5000, nchains = 3){
   mcmc_c <- compileNimble(mcmc)
   
   # run
-  tmp <- runMCMC(mcmc_c, niter = niter, nchains = nchains)
+  if(!parallel){
+    tmp <- runMCMC(mcmc_c, niter = niter, nchains = nchains, thin = thin)
+  } else{
+    tmp <- runMCMC(mcmc_c, niter = niter, nchains = nchains, thin = thin, setSeed = seed)
+  }
   
   # return
   out <- list(samples = tmp)
   return(out)
 }
 
-init_function <- function(data){
-  list(
-    z = apply(data$Y, 1, function(x) ifelse(sum(x) == 0, 0, 1)),
-    alpha = rnorm(2),
-    beta = rnorm(1),
-    rho = runif(1, .1, 5),
-    sigma = abs(rnorm(1, 0, sd = 2)),
-    mu0 = 0
-  )
-}
+# init_function <- function(data){
+#   list(
+#     z = apply(data$Y, 1, function(x) ifelse(sum(x) == 0, 0, 1)),
+#     alpha = rnorm(2),
+#     beta = rnorm(1),
+#     rho = runif(1, .1, 3),
+#     sigma = abs(rnorm(1, 0, sd = 2)),
+#     mu0 = 0
+#   )
+# }
 
 detach("package:nimble", unload = TRUE)
-suppressMessages(library(nimble))
-fit <- fit_spom(
+# fit <- fit_spom(
+#   constants = list(
+#     pocc = data$pocc,
+#     pdet = data$pdet,
+#     nsites = data$nsites,
+#     nvisits = data$nvisits,
+#     rho_upr = max(dist)/2
+#   ),
+#   data = list(
+#     Y = data$Y,
+#     x = data$X[,2],
+#     W = data$W,
+#     dist = data$dist,
+#     ones = rep(1, nrow(data$X))
+#   ),
+#   inits = init_function(data),
+#   niter = 25000,
+#   thin = 10,
+#   nchains = 3
+# )
+# saveRDS(fit, "rds files/spom/spom_fit_slice.rds")
+
+# parallel
+start <- Sys.time()
+this_cluster <- makeCluster(3)
+chain_output <- parLapply(
+  cl = this_cluster,
+  X = 4:6,
+  fun = fit_spom,
   constants = list(
     pocc = data$pocc,
     pdet = data$pdet,
@@ -1290,16 +1375,57 @@ fit <- fit_spom(
     dist = data$dist,
     ones = rep(1, nrow(data$X))
   ),
-  inits = init_function(data),
-  niter = 30000,
-  nchains = 3
+  niter = 20000,
+  thin = 10,
+  nchains = 1,
+  parallel = TRUE
 )
-saveRDS(fit, "rds files/spom/spom_fit_blockrhosigma.rds")
+stopCluster(this_cluster)
+end <- Sys.time()
+end - start
+saveRDS(chain_output, file = "rds files/spom/spom_blockandslice.rds")
 ```
+
+We first visualize traceplots for the default sampler. 
 
 ```{r, eval = T, echo = F}
 # load samples
-fit <- readRDS("rds files/spom/spom_fit.rds")
+fit <- readRDS("rds files/spom/spom_default.rds")
+fit <- list(samples = list(chain1 = fit[[1]][[1]], chain2 = fit[[2]][[1]], chain3 = fit[[3]][[1]]))
+
+# traceplots
+par(mfrow = c(3, 2))
+for(i in 1:ncol(fit$samples[[1]])){
+  plot(
+    1, type = "n", 
+    ylim = range(sapply(fit$samples, function(x) range(x[,i]))),
+    xlim = c(1, nrow(fit$samples[[1]])),
+    ylab = "estimate",
+    xlab = "iteration",
+    main = colnames(fit$samples[[1]])[i]
+  )
+  for(chain in 1:length(fit$samples)){
+    lines(fit$samples[[chain]][,i], col = chain)
+  }
+}
+
+# fit$samples <- fit$samples[5001:10000,]
+# plot_tbl <- tibble(
+#   parameter = factor(colnames(fit$samples), levels = colnames(fit$samples)),
+#   mean = colMeans(fit$samples),
+#   lwr = apply(fit$samples, 2, quantile, 0.025),
+#   upr = apply(fit$samples, 2, quantile, 0.975),
+#   truth = c(c(alphas), c(betas), rho, sigma), 
+#   in_int = ifelse(lwr <= truth & upr >= truth, "yes", "no")
+# )
+```
+
+To improve the mixing on the spatial parameters, we add a block MH sampler on the spatial random effects.
+
+```{r, eval = T, echo = F}
+# load samples
+fit <- readRDS("rds files/spom/spom_block.rds")
+fit <- list(samples = list(chain1 = fit[[1]][[1]], chain2 = fit[[2]][[1]], chain3 = fit[[3]][[1]]))
 
 # traceplots
 par(mfrow = c(3, 2))
